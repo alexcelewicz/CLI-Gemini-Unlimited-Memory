@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "gemini-memory": {
+      "command": "python",
+      "args": [
+        "server.py"
+      ],
+      "env": {
+        "GEMINI_API_KEY": "YOUR_API_KEY_HERE",
+        "GEMINI_RETRIEVAL_MODEL": "gemini-2.0-flash-exp",
+        "GEMINI_MEMORY_MAX_TOKENS": "10000"
+      }
+    }
+  }
+}
