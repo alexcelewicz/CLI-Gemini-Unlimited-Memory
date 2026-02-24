@@ -118,6 +118,106 @@ def wait_op(operation, label="operation", timeout=120):
     return operation
 
 
+def smart_chunk_text(text: str, max_size: int = 10000) -> list[str]:
+    """Split text into chunks at natural boundaries (heading > paragraph > sentence)."""
+    if len(text) <= max_size:
+        return [text]
+
+    import re
+    chunks = []
+    remaining = text
+
+    while len(remaining) > max_size:
+        window = remaining[:max_size]
+        split_at = None
+
+        # Try splitting at a markdown heading
+        for match in re.finditer(r'\n(?=#{1,3} )', window):
+            split_at = match.start()
+
+        # Fallback: paragraph boundary
+        if split_at is None or split_at < max_size // 2:
+            for match in re.finditer(r'\n\n', window):
+                candidate = match.end()
+                if candidate >= max_size // 2:
+                    split_at = candidate
+                    break
+            if split_at is None:
+                for match in re.finditer(r'\n\n', window):
+                    split_at = match.end()
+
+        # Fallback: sentence boundary
+        if split_at is None:
+            for match in re.finditer(r'[.!?]\s', window):
+                split_at = match.end()
+
+        # Hard split
+        if split_at is None or split_at < 100:
+            split_at = max_size
+
+        chunks.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip()
+
+    if remaining.strip():
+        chunks.append(remaining.strip())
+
+    return chunks
+
+
+def _upload_chunked_session(store, label: str, project: str, content: str, timestamp: str):
+    """Upload a session, automatically chunking if content exceeds 10k chars."""
+    chunks = smart_chunk_text(content)
+    total_chunks = len(chunks)
+    header = content[:content.index('\n\n') + 2] if '\n\n' in content else ""
+
+    client = get_client()
+    tmp_paths = []
+
+    try:
+        for i, chunk_text in enumerate(chunks):
+            part_num = i + 1
+            if total_chunks > 1:
+                chunk_header = f"<!-- Part {part_num}/{total_chunks} of session '{label}' -->\n\n"
+                part_label = f"session-{label}-part{part_num}"
+                chunk_content = chunk_header + (chunk_text if i == 0 else header + chunk_text)
+            else:
+                part_label = f"session-{label}"
+                chunk_content = chunk_text
+
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".md", delete=False, prefix=f"session-{label}-"
+            ) as f:
+                f.write(chunk_content)
+                tmp_paths.append(f.name)
+
+            metadata = [
+                {"key": "type", "string_value": "session_log"},
+                {"key": "project", "string_value": project},
+                {"key": "label", "string_value": label},
+                {"key": "timestamp", "string_value": timestamp},
+            ]
+            if total_chunks > 1:
+                metadata.extend([
+                    {"key": "chunk_index", "string_value": str(part_num)},
+                    {"key": "total_chunks", "string_value": str(total_chunks)},
+                ])
+
+            op = client.file_search_stores.upload_to_file_search_store(
+                file=tmp_paths[-1],
+                file_search_store_name=store.name,
+                config={
+                    "display_name": part_label,
+                    "custom_metadata": metadata,
+                },
+            )
+            wait_op(op, f"Indexing '{part_label}'")
+
+        return total_chunks
+    finally:
+        for p in tmp_paths:
+            os.unlink(p)
+
+
 def list_store_docs(store_name_str: str) -> list:
     client = get_client()
     docs = []
@@ -209,31 +309,9 @@ def cmd_save(args):
         f"{summary}"
     )
 
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".md", delete=False, prefix=f"session-{label}-"
-    ) as f:
-        f.write(content)
-        tmp_path = f.name
-
-    try:
-        client = get_client()
-        op = client.file_search_stores.upload_to_file_search_store(
-            file=tmp_path,
-            file_search_store_name=store.name,
-            config={
-                "display_name": f"session-{label}",
-                "custom_metadata": [
-                    {"key": "type", "string_value": "session_log"},
-                    {"key": "project", "string_value": args.project},
-                    {"key": "label", "string_value": label},
-                    {"key": "timestamp", "string_value": timestamp},
-                ],
-            },
-        )
-        wait_op(op, f"Indexing session '{label}'")
-        print(f"✅ Session '{label}' saved to '{args.project}' ({len(summary)} chars)")
-    finally:
-        os.unlink(tmp_path)
+    total_chunks = _upload_chunked_session(store, label, args.project, content, timestamp)
+    chunks_msg = f" ({total_chunks} chunks)" if total_chunks > 1 else ""
+    print(f"✅ Session '{label}' saved to '{args.project}' ({len(summary)} chars){chunks_msg}")
 
 
 def cmd_context(args):
@@ -255,6 +333,15 @@ def cmd_context(args):
         f"3. Current architecture and file paths — what exists NOW\n"
         f"4. Key decisions and their rationale\n"
         f"5. Function signatures, API endpoints, database schemas\n\n"
+        f"TEMPORAL REASONING (mandatory):\n"
+        f"1. Identify each document's timestamp from its header\n"
+        f"2. Convert relative time references to absolute dates based on document timestamp\n"
+        f"   (e.g., 'yesterday' in a doc timestamped 2025-03-15 means 2025-03-14)\n"
+        f"3. Most recent document timestamp = current truth when topics conflict\n"
+        f"4. Note when information might be outdated vs newer sessions\n\n"
+        f"SOURCE PRIORITY:\n"
+        f"- Prefer exact quotes from session documents when precision matters\n"
+        f"- Distinguish between direct quotes and your inferences\n\n"
         f"Query: {query}\n\n"
         f"Return a structured response a coding agent can act on immediately. "
         f"When multiple sessions describe the same topic, synthesize into the CURRENT state "
@@ -461,31 +548,11 @@ def cmd_auto_save(args):
         print("⚠️  Not enough git/project data to auto-generate. Use 'gmem save' instead.")
         sys.exit(1)
 
-    # Upload
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".md", delete=False, prefix=f"auto-session-{label}-"
-    ) as f:
-        f.write(summary)
-        tmp_path = f.name
-
-    try:
-        client = get_client()
-        op = client.file_search_stores.upload_to_file_search_store(
-            file=tmp_path,
-            file_search_store_name=store.name,
-            config={
-                "display_name": f"auto-session-{label}",
-                "custom_metadata": [
-                    {"key": "type", "string_value": "auto_session_log"},
-                    {"key": "project", "string_value": args.project},
-                    {"key": "label", "string_value": label},
-                ],
-            },
-        )
-        wait_op(op, f"Indexing auto-session '{label}'")
-        print(f"✅ Auto-session '{label}' saved ({len(summary)} chars)")
-    finally:
-        os.unlink(tmp_path)
+    # Upload (with smart chunking for large auto-summaries)
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    total_chunks = _upload_chunked_session(store, f"auto-{label}", args.project, summary, timestamp)
+    chunks_msg = f" ({total_chunks} chunks)" if total_chunks > 1 else ""
+    print(f"✅ Auto-session '{label}' saved ({len(summary)} chars){chunks_msg}")
 
 
 def cmd_consolidate(args):
@@ -619,7 +686,16 @@ def cmd_inject(args):
         f"You are a project memory system providing context to a coding agent. "
         f"Return ALL relevant information about: {query}\n\n"
         f"Prioritize: most recent state over historical, unresolved issues, "
-        f"current file paths, function signatures, and key decisions. "
+        f"current file paths, function signatures, and key decisions.\n\n"
+        f"TEMPORAL REASONING (mandatory):\n"
+        f"1. Identify each document's timestamp from its header\n"
+        f"2. Convert relative time references to absolute dates based on document timestamp\n"
+        f"   (e.g., 'yesterday' in a doc timestamped 2025-03-15 means 2025-03-14)\n"
+        f"3. Most recent document timestamp = current truth when topics conflict\n"
+        f"4. Note when information might be outdated vs newer sessions\n\n"
+        f"SOURCE PRIORITY:\n"
+        f"- Prefer exact quotes from session documents when precision matters\n"
+        f"- Distinguish between direct quotes and your inferences\n\n"
         f"Synthesize into current state rather than repeating chronological history. "
         f"Format as a structured briefing the agent can act on immediately."
     )

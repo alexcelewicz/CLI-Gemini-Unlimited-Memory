@@ -94,6 +94,57 @@ def _wait_for_operation(operation, timeout: int = 120):
     return operation
 
 
+def _smart_chunk_text(text: str, max_size: int = 10000) -> list[str]:
+    """Split text into chunks at natural boundaries (heading > paragraph > sentence).
+
+    Returns a list of text chunks, each at most max_size characters.
+    If text is shorter than max_size, returns a single-element list.
+    """
+    if len(text) <= max_size:
+        return [text]
+
+    import re
+    chunks = []
+    remaining = text
+
+    while len(remaining) > max_size:
+        # Find the best split point within max_size
+        window = remaining[:max_size]
+
+        # Try splitting at a markdown heading (## or #)
+        split_at = None
+        for match in re.finditer(r'\n(?=#{1,3} )', window):
+            split_at = match.start()  # keep updating to get the last heading boundary
+
+        # Fallback: split at double newline (paragraph boundary)
+        if split_at is None or split_at < max_size // 2:
+            for match in re.finditer(r'\n\n', window):
+                candidate = match.end()
+                if candidate >= max_size // 2:
+                    split_at = candidate
+                    break
+            if split_at is None:
+                for match in re.finditer(r'\n\n', window):
+                    split_at = match.end()
+
+        # Fallback: split at sentence boundary (. followed by space/newline)
+        if split_at is None:
+            for match in re.finditer(r'[.!?]\s', window):
+                split_at = match.end()
+
+        # Last resort: hard split at max_size
+        if split_at is None or split_at < 100:
+            split_at = max_size
+
+        chunks.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip()
+
+    if remaining.strip():
+        chunks.append(remaining.strip())
+
+    return chunks
+
+
 def _list_documents_in_store(store_name: str) -> list:
     """List all documents in a store."""
     client = get_client()
@@ -189,6 +240,13 @@ class RetrieveContextInput(BaseModel):
         ),
         ge=500,
         le=16000,
+    )
+    return_raw_chunks: bool = Field(
+        default=False,
+        description=(
+            "When true, include raw grounding chunks from File Search alongside "
+            "the synthesized summary. Useful for agents that need exact source text."
+        ),
     )
 
 
@@ -403,50 +461,79 @@ async def save_session(params: SaveSessionInput) -> str:
     label = params.session_label or datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     doc_display_name = f"session-{label}"
 
-    content = (
+    header = (
         f"# Session Log: {label}\n"
         f"**Timestamp:** {timestamp}\n"
         f"**Project:** {params.project_name}\n\n"
-        f"{params.summary}"
     )
+    full_content = header + params.summary
 
-    # Write to a temp file and upload
+    # Smart chunking: split large sessions into multiple documents
+    chunks = _smart_chunk_text(full_content)
+    total_chunks = len(chunks)
+
     import tempfile
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".md", delete=False, prefix=f"session-{label}-"
-    ) as f:
-        f.write(content)
-        tmp_path = f.name
+    client = get_client()
+    uploaded_docs = []
 
     try:
-        client = get_client()
-        operation = client.file_search_stores.upload_to_file_search_store(
-            file=tmp_path,
-            file_search_store_name=store.name,
-            config={
-                "display_name": doc_display_name,
-                "custom_metadata": [
-                    {"key": "type", "string_value": "session_log"},
-                    {"key": "project", "string_value": params.project_name},
-                    {"key": "label", "string_value": label},
-                    {"key": "timestamp", "string_value": timestamp},
-                ],
-            },
-        )
+        tmp_paths = []
+        for i, chunk_text in enumerate(chunks):
+            part_num = i + 1
+            if total_chunks > 1:
+                chunk_header = f"<!-- Part {part_num}/{total_chunks} of session '{label}' -->\n\n"
+                part_label = f"session-{label}-part{part_num}"
+                chunk_content = chunk_header + (chunk_text if i == 0 else header + chunk_text)
+            else:
+                part_label = doc_display_name
+                chunk_content = chunk_text
 
-        operation = _wait_for_operation(operation)
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".md", delete=False, prefix=f"session-{label}-"
+            ) as f:
+                f.write(chunk_content)
+                tmp_paths.append(f.name)
 
-        return json.dumps({
+            metadata = [
+                {"key": "type", "string_value": "session_log"},
+                {"key": "project", "string_value": params.project_name},
+                {"key": "label", "string_value": label},
+                {"key": "timestamp", "string_value": timestamp},
+            ]
+            if total_chunks > 1:
+                metadata.extend([
+                    {"key": "chunk_index", "string_value": str(part_num)},
+                    {"key": "total_chunks", "string_value": str(total_chunks)},
+                ])
+
+            operation = client.file_search_stores.upload_to_file_search_store(
+                file=tmp_paths[-1],
+                file_search_store_name=store.name,
+                config={
+                    "display_name": part_label,
+                    "custom_metadata": metadata,
+                },
+            )
+            operation = _wait_for_operation(operation)
+            uploaded_docs.append(part_label)
+
+        result = {
             "status": "saved",
             "document_name": doc_display_name,
             "store": store.display_name,
             "timestamp": timestamp,
             "summary_length": len(params.summary),
             "message": f"Session '{label}' saved to project '{params.project_name}'.",
-        }, indent=2)
+        }
+        if total_chunks > 1:
+            result["chunks"] = total_chunks
+            result["document_names"] = uploaded_docs
+
+        return json.dumps(result, indent=2)
 
     finally:
-        os.unlink(tmp_path)
+        for p in tmp_paths:
+            os.unlink(p)
 
 
 @mcp.tool(
@@ -502,6 +589,15 @@ async def retrieve_context(params: RetrieveContextInput) -> str:
         f"3. Current architecture and file paths — what exists NOW, not historical states\n"
         f"4. Key decisions and their rationale — why things were built a certain way\n"
         f"5. Function signatures, API endpoints, database schemas — actionable technical detail\n\n"
+        f"TEMPORAL REASONING (mandatory):\n"
+        f"1. Identify each document's timestamp from its header\n"
+        f"2. Convert relative time references to absolute dates based on document timestamp\n"
+        f"   (e.g., 'yesterday' in a doc timestamped 2025-03-15 means 2025-03-14)\n"
+        f"3. Most recent document timestamp = current truth when topics conflict\n"
+        f"4. Note when information might be outdated vs newer sessions\n\n"
+        f"SOURCE PRIORITY:\n"
+        f"- Prefer exact quotes from session documents when precision matters\n"
+        f"- Distinguish between direct quotes and your inferences\n\n"
         f"Query: {params.query}\n\n"
         f"Return a structured response a coding agent can act on immediately. "
         f"When multiple sessions describe the same topic, synthesize into the CURRENT state "
@@ -526,14 +622,26 @@ async def retrieve_context(params: RetrieveContextInput) -> str:
 
     # Extract grounding metadata if available
     grounding_info = None
+    raw_chunks = None
     if response.candidates and response.candidates[0].grounding_metadata:
         gm = response.candidates[0].grounding_metadata
         grounding_info = {
             "grounding_chunks_count": len(gm.grounding_chunks) if gm.grounding_chunks else 0,
             "grounding_supports_count": len(gm.grounding_supports) if gm.grounding_supports else 0,
         }
+        # Extract raw chunk text when requested
+        if params.return_raw_chunks and gm.grounding_chunks:
+            raw_chunks = []
+            for chunk in gm.grounding_chunks:
+                rc = getattr(chunk, "retrieved_context", None)
+                if rc:
+                    raw_chunks.append({
+                        "text": getattr(rc, "text", None),
+                        "uri": getattr(rc, "uri", None),
+                        "title": getattr(rc, "title", None),
+                    })
 
-    return json.dumps({
+    result = {
         "status": "retrieved",
         "project": params.project_name,
         "query": params.query,
@@ -542,7 +650,11 @@ async def retrieve_context(params: RetrieveContextInput) -> str:
         "grounding": grounding_info,
         "model_used": RETRIEVAL_MODEL,
         "message": f"Context retrieved for project '{params.project_name}' ({doc_count} documents in store).",
-    }, indent=2)
+    }
+    if raw_chunks is not None:
+        result["raw_chunks"] = raw_chunks
+
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool(

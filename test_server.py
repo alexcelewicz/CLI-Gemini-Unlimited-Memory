@@ -114,7 +114,7 @@ def main():
     try:
         print("Querying store for context...")
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3-flash-preview",
             contents="What API endpoints and authentication methods were used?",
             config=types.GenerateContentConfig(
                 tools=[

@@ -46,83 +46,74 @@ A typical session summary is ~500-2000 tokens. You could save 1000 sessions for 
 
 - Python 3.10+
 - A [Google Gemini API key](https://aistudio.google.com/apikey)
-- Claude Code or any MCP-compatible client
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI installed
 
 ## Installation
 
-### 1. Clone/copy the server
+```powershell
+# Clone the repo
+git clone https://github.com/Alek-Cel/CLI-Unlimited-Memory.git
+cd CLI-Unlimited-Memory
 
-```bash
-# Put it wherever you keep your tools
-mkdir -p ~/tools/gemini-memory-mcp
-cp server.py requirements.txt ~/tools/gemini-memory-mcp/
+# Run the installer
+./install.ps1 -ApiKey "your-gemini-api-key"
 ```
 
-### 2. Set up Python environment
+That's it. The installer handles everything:
+- Creates a Python venv and installs dependencies
+- Deploys files to `~/tools/gemini-memory-mcp/`
+- Registers the MCP server with Claude Code
+- Creates the `gmem` CLI command
+- Configures compaction hooks (auto-save/restore context)
 
-```bash
-cd ~/tools/gemini-memory-mcp
-python -m venv .venv
+**Windows (PowerShell 5.1+):** Works out of the box.
 
-# Windows
-.venv\Scripts\activate
+**macOS/Linux (PowerShell 7+):** Install PowerShell first: `brew install powershell` or see [Microsoft docs](https://learn.microsoft.com/en-us/powershell/scripting/install/installing-powershell).
 
-# macOS/Linux
-source .venv/bin/activate
+### Installer Options
 
-pip install -r requirements.txt
+| Flag | Description |
+|------|-------------|
+| `-ApiKey "key"` | Gemini API key (skips auto-detection / prompt) |
+| `-InstallDir "path"` | Custom install location (default: `~/tools/gemini-memory-mcp`) |
+| `-SkipHooks` | Don't configure Claude Code compaction hooks |
+| `-SkipTest` | Don't run post-install verification |
+| `-Uninstall` | Remove everything (see below) |
+
+### API Key Resolution
+
+If you don't pass `-ApiKey`, the installer looks for an existing key in this order:
+1. Existing `claude mcp get gemini-memory` registration
+2. `GEMINI_API_KEY` environment variable
+3. Interactive prompt
+
+This means re-running the installer after `git pull` preserves your API key automatically.
+
+## Update
+
+```powershell
+cd CLI-Unlimited-Memory
+git pull
+./install.ps1
 ```
 
-### 3. Set your API key
+The installer detects your existing API key from the previous MCP registration, refreshes all files and dependencies, and re-registers the server.
 
-```bash
-# Windows (PowerShell)
-$env:GEMINI_API_KEY = "your-key-here"
+## Uninstall
 
-# Or set it permanently in your environment variables
-
-# macOS/Linux
-export GEMINI_API_KEY="your-key-here"
-# Or add to ~/.bashrc / ~/.zshrc
+```powershell
+./install.ps1 -Uninstall
 ```
 
-### 4. Configure Claude Code
+Removes:
+- MCP server registration from Claude Code
+- Compaction hooks from `~/.claude/settings.json`
+- Wrapper scripts (`gmem`, `gmem-precompact`, `gmem-postcompact`)
+- Install directory (`~/tools/gemini-memory-mcp/`)
 
-Add to your Claude Code MCP config (`~/.claude/claude_desktop_config.json` or project-level `.mcp.json`):
+Your Gemini memory stores are **not** deleted — they live in your Google account and persist independently.
 
-```json
-{
-  "mcpServers": {
-    "gemini-memory": {
-      "command": "python",
-      "args": ["C:/Users/YOUR_USER/tools/gemini-memory-mcp/server.py"],
-      "env": {
-        "GEMINI_API_KEY": "your-key-here",
-        "GEMINI_RETRIEVAL_MODEL": "gemini-2.5-flash",
-        "GEMINI_MEMORY_MAX_TOKENS": "5000"
-      }
-    }
-  }
-}
-```
-
-**For Windows with venv**, use the full path to the venv Python:
-
-```json
-{
-  "mcpServers": {
-    "gemini-memory": {
-      "command": "C:/Users/YOUR_USER/tools/gemini-memory-mcp/.venv/Scripts/python.exe",
-      "args": ["C:/Users/YOUR_USER/tools/gemini-memory-mcp/server.py"],
-      "env": {
-        "GEMINI_API_KEY": "your-key-here"
-      }
-    }
-  }
-}
-```
-
-## Available Tools
+## Available MCP Tools
 
 | Tool | Description |
 |------|-------------|
@@ -133,83 +124,91 @@ Add to your Claude Code MCP config (`~/.claude/claude_desktop_config.json` or pr
 | `gemini_memory_upload_file` | Upload a file to a project store for indexing |
 | `gemini_memory_list_documents` | List all documents in a project store |
 | `gemini_memory_delete_document` | Delete a document from a project store |
+| `gemini_memory_consolidate` | Merge old sessions into a single summary |
 | `gemini_memory_delete_store` | Delete an entire project store (irreversible) |
 
-## Usage Workflow
+## CLI Tool (`gmem`)
 
-### Starting a New Project
+The installer also sets up `gmem`, a standalone CLI that works with **any** coding agent (Claude Code, Gemini CLI, Cursor, Aider, etc.).
 
-```
-You: "Create a memory store for my verbscribe-website project"
-Agent: → calls gemini_memory_create_store(project_name="verbscribe-website")
-```
+```bash
+gmem init my-website                    # Create a project store
+gmem stores                             # List all stores
 
-### End of Session — Save Context
+# Save sessions
+gmem save my-website --label auth-v1 -m "Built JWT auth with refresh tokens"
+gmem save my-website                    # Interactive editor
+echo "summary..." | gmem save my-site   # Piped from script
 
-```
-You: "Save this session to project memory"
-Agent: → Generates structured summary of what was done
-      → calls gemini_memory_save_session(
-            project_name="verbscribe-website",
-            session_label="landing-page-v1",
-            summary="## What was built\n- Landing page at /src/pages/index.tsx\n- Hero component with CTA..."
-         )
-```
+# Retrieve context
+gmem context my-website "auth flow and endpoints"
+gmem context my-website "database schema" --tokens 2000
 
-### Start of Next Session — Retrieve Context
+# Auto-save from git state (great for hooks!)
+gmem auto-save my-website . --label session-3
 
-```
-You: "Retrieve context about the frontend architecture"
-Agent: → calls gemini_memory_retrieve_context(
-            project_name="verbscribe-website",
-            query="frontend architecture, components, routing, and API endpoints"
-         )
-      → Gets back: full summary of landing page work, component structure, etc.
-      → Continues working with full awareness
-```
+# Inject context into agent workflows
+gmem inject my-website "full architecture" --output .context.md
+gmem inject my-website "recent changes" --clipboard
 
-### Upload Key Files
+# Consolidate old sessions
+gmem consolidate my-website --keep 5
 
-```
-You: "Upload the database schema to project memory"
-Agent: → calls gemini_memory_upload_file(
-            project_name="verbscribe-website",
-            file_path="/path/to/schema.sql"
-         )
+# File management
+gmem upload my-website ./schema.sql
+gmem docs my-website
+gmem delete-doc my-website "old-session"
+gmem delete my-website
 ```
 
-## Tips for CLAUDE.md Integration
+### Usage with Any Agent
 
-Add this to your project's `CLAUDE.md` to make the memory automatic:
-
-```markdown
-## Project Memory (Gemini File Search)
-
-This project uses persistent memory via the Gemini Memory MCP server.
-
-### At the START of every session:
-1. Call `gemini_memory_retrieve_context` with project_name="YOUR_PROJECT"
-   and a query describing what you're about to work on
-2. Use the retrieved context to understand prior work
-
-### At the END of every session:
-1. Call `gemini_memory_save_session` with a structured summary including:
-   - What was built/changed (with file paths)
-   - Key decisions and their rationale
-   - API endpoints, schemas, hooks used
-   - Current status and next steps
-   - Any bugs found or issues noted
-
-### When creating key files:
-- Upload important files (schemas, configs, READMEs) with `gemini_memory_upload_file`
+**Gemini CLI** — pipe context as initial prompt:
+```bash
+gmem inject my-website "what was done last" | gemini "continue from where we left off"
 ```
+
+**Git hook** — auto-save after each commit:
+```bash
+# .git/hooks/post-commit
+#!/bin/bash
+gmem auto-save my-website . --label "commit-$(git rev-parse --short HEAD)"
+```
+
+**Any agent** — wrap sessions:
+```bash
+# Before session
+gmem inject my-website "full context" --output .context.md
+
+# ... do your work ...
+
+# After session
+gmem save my-website --label "feature-x" -m "Built feature X with endpoints /api/x..."
+```
+
+## CLAUDE.md Integration
+
+To make memory fully automatic, copy `CLAUDE-MD-SNIPPET.md` into your global `~/.claude/CLAUDE.md` or project-level `CLAUDE.md`. This tells Claude Code to:
+- Retrieve context at the start of every session
+- Save session summaries automatically when tasks complete
+- Upload important files to memory
+
+## Compaction Hooks
+
+The installer configures Claude Code hooks so memory survives context compaction:
+
+- **PreCompact**: Summarizes the full conversation transcript and saves it to Gemini Memory
+- **SessionStart (compact)**: After compaction, retrieves and injects project context back into the session
+
+This means you never lose detailed context when Claude Code compacts your conversation.
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GEMINI_API_KEY` | (required) | Your Google Gemini API key |
-| `GEMINI_RETRIEVAL_MODEL` | `gemini-2.5-flash` | Model used for context retrieval |
+| `GEMINI_RETRIEVAL_MODEL` | `gemini-3-flash-preview` | Model used for context retrieval |
+| `GEMINI_SUMMARY_MODEL` | `gemini-3-flash-preview` | Model used for transcript summarization |
 | `GEMINI_MEMORY_MAX_TOKENS` | `5000` | Default max tokens for retrieved context |
 | `GEMINI_STORE_PREFIX` | `project-memory` | Prefix for store display names |
 
@@ -240,100 +239,6 @@ The `max_output_tokens` parameter on `retrieve_context` controls how much contex
                     │ (retrieval)  │
                     └──────────────┘
 ```
-
----
-
-## Option B: Standalone CLI Tool (`gmem`)
-
-If you prefer a standalone CLI over MCP, or want something that works with **any** agent (Gemini CLI, Cursor, Aider, etc.), use `gmem.py`.
-
-### Setup
-
-```bash
-cd ~/tools/gemini-memory-mcp
-python -m venv .venv
-.venv\Scripts\activate           # Windows
-pip install -r requirements.txt
-
-# Windows: run setup-gmem.bat
-# Linux/macOS: bash setup-gmem.sh
-```
-
-### Commands
-
-```bash
-gmem init my-website                    # Create a project store
-gmem stores                             # List all stores
-
-# Save sessions
-gmem save my-website --label auth-v1 -m "Built JWT auth with refresh tokens"
-gmem save my-website                    # Interactive editor
-echo "summary..." | gmem save my-site   # Piped from script
-
-# Retrieve context
-gmem context my-website "auth flow and endpoints"
-gmem context my-website "database schema" --tokens 2000
-
-# Auto-save from git state (great for hooks!)
-gmem auto-save my-website . --label session-3
-
-# Inject context into agent workflows
-gmem inject my-website "full architecture" --output .context.md
-gmem inject my-website "recent changes" --clipboard
-
-# File management
-gmem upload my-website ./schema.sql
-gmem docs my-website
-gmem delete-doc my-website "old-session"
-gmem delete my-website
-```
-
-### Usage with Any Agent
-
-**Claude Code** — inject context before starting:
-```bash
-gmem inject my-website "full project context" --output .context.md
-# Then in Claude Code, the .context.md file is available
-```
-
-**Gemini CLI** — pipe context as initial prompt:
-```bash
-gmem inject my-website "what was done last" | gemini "continue from where we left off"
-```
-
-**Git hook** — auto-save after each commit:
-```bash
-# .git/hooks/post-commit
-#!/bin/bash
-gmem auto-save my-website . --label "commit-$(git rev-parse --short HEAD)"
-```
-
-**Any agent** — wrap sessions:
-```bash
-# Before session
-gmem inject my-website "full context" --output .context.md
-
-# ... do your work ...
-
-# After session
-gmem save my-website --label "feature-x" -m "Built feature X with endpoints /api/x..."
-```
-
-### Option A vs Option B — When to Use Which
-
-| | MCP Server (Option A) | CLI Tool (Option B) |
-|---|---|---|
-| **Best for** | Claude Code (native integration) | Any agent, scripting, git hooks |
-| **Auto-integration** | Agent calls tools directly | Manual or scripted |
-| **Save/retrieve** | Agent-initiated | You trigger it |
-| **Git hooks** | ❌ | ✅ `gmem auto-save` |
-| **Clipboard inject** | ❌ | ✅ `gmem inject --clipboard` |
-| **File output** | ❌ | ✅ `gmem inject --output` |
-| **Piping** | ❌ | ✅ Full stdin/stdout support |
-
-**You can use both simultaneously** — they share the same Gemini stores.
-
----
 
 ## Limitations
 
